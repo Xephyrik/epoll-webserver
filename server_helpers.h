@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <assert.h>
+#include <string.h>
 
 #ifdef DEBUG
     #define LOG(args...) fprintf(stderr, args)
