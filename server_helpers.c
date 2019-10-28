@@ -8,9 +8,9 @@ ssize_t read_header(int socket, char *buffer, size_t count) {
 
     errno = 0;
     size_t progress = 0;
-    while (progress < count && (progress < 2 || strncmp(buffer + progress-2, "\n\n", 2))) { //continue until a newline is in the buffer
+    while (progress < count && (progress < 2 || strncmp(buffer + (progress - 1), "\n\n", 2) != 0)) { //continue until a newline is in the buffer
 	ssize_t result = read(socket, buffer + progress, 1);
-
+	//LOG("\t\t%zu read, \"%s\"\n", result, buffer + progress);
 	if (result > 0) {
 	    progress += result;
 	} else if (result == -1 && errno == EINTR) {
@@ -18,11 +18,12 @@ ssize_t read_header(int socket, char *buffer, size_t count) {
 	    continue;
 	} else if (result == -1) {
 	    return -1;
-	} else {
+	} else { //result == 0, we are finished
+	    LOG("\t\t%zu read. Done (0)\n", progress);
 	    return progress;
 	}
     }
-    LOG("%zu read\n", progress);
+    LOG("\t\t%zu read. Done (\\n\\n)\n", progress);
     return progress;
 }
 
