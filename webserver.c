@@ -21,18 +21,25 @@
 #define TIMEOUT_MS 1000
 #define EVENT_BUFFER 100
 
+
+typedef struct request_info request_info;
+
 void init_server();
 int handle_request(int fd);
 void accept_connections();
 int send_status(int fd, int status, struct request_info *);
+int send_status_n(int fd, int status, struct request_info *, size_t content_length);
 void add_client(int fd);
 void remove_client(int fd);
+void acknowledge_sigpipe(int);
 void graceful_exit(int);
 verb check_verb(char *header);
 
 struct request_info *client_requests[100];
 
 char *status_desc[510];
+
+static char *ROOT_SITE = "Root";
 
 static volatile int epollfd;
 static volatile int server_socket;
@@ -58,14 +65,14 @@ int main(int argc, char **argv) {
 	//statu codes
 	status_desc[200] = "OK";
 	status_desc[204] = "No Content";
-	status_desc[400] = "Bad Reques";
+	status_desc[400] = "Bad Request";
 	status_desc[401] = "Unauthorized";
 	status_desc[404] = "Not Found";
 	status_desc[405] = "Method Not Allowed";
 
 	//signal handling
 	signal(SIGINT, graceful_exit);
-
+	signal(SIGPIPE, acknowledge_sigpipe);
 	//start server
 	init_server(argv[1]);
 	LOG("Server Initialized on port %s\n", argv[1]);
@@ -175,10 +182,10 @@ int handle_request(int fd) {
 
 		if (req_info->request_h == NULL) {
 			LOG("\tHeader buffer allocated\n");
-			req_info->request_h = calloc(1,MAX_HEADER_SIZE*sizeof(char));
+			req_info->request_h = calloc(1, MAX_HEADER_SIZE*sizeof(char));
 		}
 
-		ssize_t read_status = read_header(fd, req_info->request_h + req_info->progress, MAX_HEADER_SIZE);
+		ssize_t read_status = read_header(fd, req_info->request_h + req_info->progress, MAX_HEADER_SIZE - req_info->progress);
 		LOG("\tRead status: %zu\n", read_status);
 
 		//Did we make progress?
@@ -192,7 +199,7 @@ int handle_request(int fd) {
 		if (errno == EWOULDBLOCK || errno == EAGAIN) {
 			LOG("Read blocked!\n");
 			//Resume request later
-			return 2;
+			return 0;
 		} else if (errno == SIGPIPE) {
 			LOG("Sigpipe on %d\n", fd);
 			//Ignore request
@@ -213,7 +220,11 @@ int handle_request(int fd) {
 	if (req_info->req_type == V_UNKNOWN) {
 		if (req_info->stage == 1) {
 			if (req_info->response_h == NULL) {
-				req_info->response_h = calloc(1, MAX_HEADER_SIZE);
+
+				//Allocate space for the response header
+				if (req_info->response_h == NULL) {
+					req_info->response_h = calloc(1, MAX_HEADER_SIZE);
+				}
 
 				int ret = send_status(fd, 400, req_info);
 				if (ret != 0) { //block or error
@@ -223,29 +234,104 @@ int handle_request(int fd) {
 		}
 
 	} else if (req_info->req_type == GET) {
-		LOG("\n\tGET\n");
-		if (req_info->stage == 1) {
-			if (req_info->response_h == NULL) {
-				req_info->response_h = calloc(1, MAX_HEADER_SIZE);
+		char filename[MAX_FILENAME_SIZE];
 
-				//TODO: check if the resource actually exists
-				//char *filename[MAX_FILENAME_SIZE];
-				int ret = send_status(fd, 200, req_info);
-				if (ret != 0) { //block or error
-					return ret;
-				}
-			}
-			//send file
+		//Check if we can scan the filename
+		if (sscanf(req_info->request_h, "%*s %s", filename + strlen(ROOT_SITE)) != 1) {
+			return send_status(fd, 400, req_info);
 		}
+
+		// filename = ROOT_SITE .. filename (init.html if needed)
+		memcpy(filename, ROOT_SITE, strlen(ROOT_SITE));
+		LOG("\tGET %s\n", filename);
+
+		//Attach \"init.html\" if they specified a directory
+		//as opposed to a file (i.e. favicon.ico)
+		if (strchr(filename, '.') == NULL) {
+			if (filename[strlen(filename)-1] == '/') {
+				strncat(filename, "init.html", 11);
+			} else {
+				strncat(filename, "/init.html", 11);
+			}
+		}
+
+		//Allocate space for the response header
+		if (req_info->response_h == NULL) {
+			req_info->response_h = calloc(1, MAX_HEADER_SIZE);
+		}
+
+		//Check if resource exists
+		if (access(filename, F_OK) != 0) {
+			return send_status(fd, 404, req_info);
+		}
+
+		//Check file size
+		struct stat file_stat;
+		if (stat(filename, &file_stat) == -1) {
+			perror("stat");
+			return 3;
+		}
+		size_t file_size = (size_t)file_stat.st_size;
+
+		LOG("Final file path: %s, File size: %zu\n", filename, file_size);
+
+		if (req_info->stage == 1) {
+
+			//send response header, returning on block or error
+			int ret = 0;
+			if ((ret = send_status_n(fd, 200, req_info, file_size)) != 1) { 
+				return ret;
+			}
+		}
+
+		//Get the actual file path, file size, and then write as much as possible
+		if (req_info->stage == 2) {
+
+			FILE *file = fopen(filename, "r");
+
+			ssize_t write_status = write_all_to_socket_from_file(fd, file, 
+				file_size - req_info->progress, req_info->progress);
+
+			fclose(file);
+
+			//Did we make progress?
+			if (write_status > 0) {
+				req_info->progress += write_status;
+			}
+
+			LOG("Write progress: %zu\n", req_info->progress);
+
+			//Return on block/error, otherwise go to next stage
+			if (errno == EWOULDBLOCK || errno == EAGAIN) {
+				LOG("Write blocked!\n");
+				//Resume request later
+				return 0;
+			} else if (errno == SIGPIPE) {
+				LOG("Sigpipe on %d\n", fd);
+				//Ignore request
+				return 3;
+			} else if (errno != 0) { //SIGPIPE or error
+				LOG("Error writing file\n");
+				//Ignore request
+				return 3;
+			} else {
+				LOG("Completed writing file!\n");
+				return 1; //Success!
+			}
+	
+		}
+
 	} else {
+		//Method not allowed (Not recognised)
 		if (req_info->stage == 1) {
 			if (req_info->response_h == NULL) {
-				req_info->response_h = calloc(1, MAX_HEADER_SIZE);
 
-				int ret = send_status(fd, 405, req_info);
-				if (ret != 0) { //block or error
-					return ret;
+				//Allocate space for the response header
+				if (req_info->response_h == NULL) {
+					req_info->response_h = calloc(1, MAX_HEADER_SIZE);
 				}
+
+				return send_status(fd, 405, req_info);
 			}
 		}
 	}
@@ -254,22 +340,26 @@ int handle_request(int fd) {
 }
 
 int send_status(int fd, int status, struct request_info *req_info) {
+	LOG("Preparing a status of %d\n", status);
+
+	//Get formatted date
 	char date[100];
 	time_t now = time(0);
 	struct tm tm = *gmtime(&now);
 	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S %Z", &tm);
 
+	//Format response
 	sprintf(req_info->response_h, "HTTP/1.1 %d %s\n"
 			"Date: %s\n"
-			"Connection: close\n"
-			"\n",
+			"Connection: close\n\n",
 			status, status_desc[status], date);
+
 
 	ssize_t write_status = write_all_to_socket(fd, 
 			req_info->response_h + req_info->progress, 
 			strlen(req_info->response_h) - req_info->progress);
 
-	LOG("\tWrite status: %zu\n", write_status);
+	LOG("\n\tWrite status: %zu\nResponse:\n\"%s\"\n", write_status, req_info->response_h);
 
 	//Did we make progress?
 	if (write_status > 0) {
@@ -278,43 +368,91 @@ int send_status(int fd, int status, struct request_info *req_info) {
 
 	//Return on block/error, otherwise go to next stage
 	if (errno == EWOULDBLOCK || errno == EAGAIN) {
-		LOG("Write blocked!");
+		LOG("Write blocked!\n");
 		//Resume request later
-		return 2;
+		return 0;
 	} else if (errno == SIGPIPE) {
 		LOG("Sigpipe on %d\n", fd);
 		//Ignore request
 		return 3;
 	} else if (errno != 0) { //SIGPIPE or error
-		LOG("Error writing header");
+		LOG("Error writing header\n");
 		//Ignore request
 		return 3;
 	} else {
-		LOG("completed writing header!");
-		req_info->stage = 2;
+		LOG("Completed writing response!\n");
+		req_info->stage += 1;
 		req_info->progress = 0;
 	}
 
-	return 0;
+	return 1;
+}			
+
+int send_status_n(int fd, int status, struct request_info *req_info, size_t file_size) {
+	LOG("Sending a status of %d\n", status);
+
+	char date[100];
+	time_t now = time(0);
+	struct tm tm = *gmtime(&now);
+	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S %Z", &tm);
+
+	sprintf(req_info->response_h, "HTTP/1.1 %d %s\n"
+			"Date: %s\n"
+			"Connection: close\n"
+			"Content-Length: %zu\n\n",
+			status, status_desc[status], date, file_size);
+
+	ssize_t write_status = write_all_to_socket(fd, 
+			req_info->response_h + req_info->progress, 
+			strlen(req_info->response_h) - req_info->progress);
+
+	LOG("\n\tWrite status: %zu\nResponse:\n\"%s\"\n", write_status, req_info->response_h);
+
+	//Did we make progress?
+	if (write_status > 0) {
+		req_info->progress += write_status;
+	}
+
+	//Return on block/error, otherwise go to next stage
+	if (errno == EWOULDBLOCK || errno == EAGAIN) {
+		LOG("Write blocked!\n");
+		//Resume request later
+		return 0;
+	} else if (errno == SIGPIPE) {
+		LOG("Sigpipe on %d\n", fd);
+		//Ignore request
+		return 3;
+	} else if (errno != 0) { //SIGPIPE or error
+		LOG("Error writing header\n");
+		//Ignore request
+		return 3;
+	} else {
+		LOG("Completed writing response!\n");
+		req_info->stage += 1;
+		req_info->progress = 0;
+	}
+
+	return 1;
 }			
 
 //return the type of request indicated by the beginning of the header
 verb check_verb(char *header) {
-	if (strncmp(header, "GET ", 4)) {
+
+	if (strncmp(header, "GET ", 4) == 0) {
 		return GET;
-	} else if (strncmp(header, "HEAD ", 5)) {
+	} else if (strncmp(header, "HEAD ", 5) == 0) {
 		return HEAD;
-	} else if (strncmp(header, "POST ", 5)) {
+	} else if (strncmp(header, "POST ", 5) == 0) {
 		return POST;
-	} else if (strncmp(header, "PUT ", 4)) {
+	} else if (strncmp(header, "PUT ", 4) == 0) {
 		return HEAD;
-	} else if (strncmp(header, "DELETE ", 7)) {
+	} else if (strncmp(header, "DELETE ", 7) == 0) {
 		return HEAD;
-	} else if (strncmp(header, "CONNECT ", 8)) {
+	} else if (strncmp(header, "CONNECT ", 8) == 0) {
 		return HEAD;
-	} else if (strncmp(header, "OPTIONS ", 8)) {
+	} else if (strncmp(header, "OPTIONS ", 8) == 0) {
 		return HEAD;
-	} else if (strncmp(header, "TRACE ", 6)) {
+	} else if (strncmp(header, "TRACE ", 6) == 0) {
 		return HEAD;
 	}
 	return V_UNKNOWN;
@@ -377,6 +515,10 @@ void accept_connections() {
 			errno = 0;
 		}
 	}
+}
+
+void acknowledge_sigpipe(int arg) {
+	LOG("SIGPIPE!\n");
 }
 
 void graceful_exit(int arg) {
