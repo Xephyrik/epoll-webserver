@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
             }
         }
         if (strcmp(argv[i], "-s") == 0) {
-                //open server in https
+            //open server in https
         }
     }
 
@@ -117,7 +117,8 @@ int main(int argc, char **argv) {
     LOG("Server Initialized on port %s\n", argv[1]);
 
     //mark file descriptors as non-blocking
-    fcntl(server_socket, F_SETFL, O_NONBLOCK);
+    int flags = fcntl(server_socket, F_GETFL, 0);
+    fcntl(server_socket, F_SETFL, flags | O_NONBLOCK);
 
     //start epolling
     epollfd = epoll_create(1);
@@ -245,8 +246,8 @@ int handle_request(int fd) {
     } else if (req_info->req_type == GET || req_info->req_type == HEAD) {
         return get(req_info);
 
-    } else if (req_info->req_type == PUT) {
-        return put(req_info);
+    //else if (req_info->req_type == PUT) {
+    //  return put(req_info);
 
     } else { //Verb not implemented/allowed send status 405
         if (req_info->response_h == NULL) {
@@ -361,7 +362,9 @@ void graceful_exit(int arg) {
     }
 
     close(server_socket);
-    fclose(http_log);
+    if (http_log != NULL) {
+        fclose(http_log);
+    }
     exit(0);
 }
 
@@ -414,14 +417,7 @@ int get_header(request_info *req_info) {
 int v_unknown(request_info *req_info) {
     int fd = req_info->event->data.fd;
 
-    if (req_info->response_h == NULL) {
-        //Allocate space for the response header
-        if (req_info->response_h == NULL) {
-            req_info->response_h = calloc(1, MAX_HEADER_SIZE);
-        }
-
-        return send_status(fd, 400, req_info);
-    }
+    return send_status(fd, 400, req_info);
 }
 
 int get(request_info *req_info) {
@@ -448,11 +444,6 @@ int get(request_info *req_info) {
         }
     } else if (strstr(filename, "..") != NULL) {
         return send_status(fd, 403, req_info);
-    }
-
-    //Allocate space for the response header
-    if (req_info->response_h == NULL) {
-        req_info->response_h = calloc(1, MAX_HEADER_SIZE);
     }
 
     //Check if resource exists
@@ -524,6 +515,7 @@ int get(request_info *req_info) {
 }
 
 int put(request_info *req_info) {
+
     int fd = req_info->event->data.fd;
 
     char filename[MAX_FILENAME_SIZE];
@@ -548,13 +540,7 @@ int put(request_info *req_info) {
     } else if (strstr(filename, "..") != NULL) {
         return send_status(fd, 403, req_info);
     }
-
-    //Allocate space for the response header
-    if (req_info->response_h == NULL) {
-        req_info->response_h = calloc(1, MAX_HEADER_SIZE);
-    }
-
-    // 
+ 
     if (access(filename, F_OK) == 0) {
         remove(filename);
     }
@@ -622,6 +608,11 @@ int put(request_info *req_info) {
 int send_status(int fd, int status, struct request_info *req_info) {
     LOG("Preparing a status of %d\n", status);
 
+    //Allocate space for the response header
+    if (req_info->response_h == NULL) {
+        req_info->response_h = calloc(1, MAX_HEADER_SIZE);
+    }
+
     //in case of block and resume, dont overwrite response_h
     if (strlen(req_info->response_h) < 1) {
         char date[100];
@@ -671,6 +662,11 @@ int send_status(int fd, int status, struct request_info *req_info) {
 
 int send_status_n(int fd, int status, struct request_info *req_info, size_t file_size) {
     LOG("Sending a status of %d\n", status);
+
+    //Allocate space for the response header
+    if (req_info->response_h == NULL) {
+        req_info->response_h = calloc(1, MAX_HEADER_SIZE);
+    }
 
     //in case of block and resume, dont overwrite response_h
     if (strlen(req_info->response_h) < 1) {

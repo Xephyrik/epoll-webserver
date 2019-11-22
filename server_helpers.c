@@ -9,6 +9,7 @@ ssize_t read_header(int socket, char *buffer, size_t count) {
     errno = 0;
     size_t progress = 0;
     while (progress < count) { //continue until a newline is in the buffer
+	//TODO: fix blocking when no \n\n is found
         ssize_t result = read(socket, buffer + progress, 1);
 
         if (result > 0) { 
