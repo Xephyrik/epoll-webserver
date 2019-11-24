@@ -13,7 +13,6 @@
     #define LOG(...)
 #endif
 
-#define MESSAGE_SIZE_DIGITS sizeof(size_t)
 #define MAX_HEADER_SIZE 1024 //413 Entity Too large if header size > MAX_HEADER_SIZE
 #define MAX_FILENAME_SIZE 255
 #define SOCKET_BUFFER 8096
