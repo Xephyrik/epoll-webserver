@@ -46,10 +46,12 @@ int put(request_info *);
 int send_status(int fd, int status, struct request_info *);
 int send_status_n(int fd, int status, struct request_info *, size_t content_length);
 int send_list(int fd, char *filename, struct request_info *);
+int send_error(int fd, int status, struct request_info *);
+
 struct request_info *client_requests[100];
 char *status_desc[510];
 
-static char *ROOT_SITE = "public_html";
+char *root_site;
 static char *DEFAULT_LOG = "http_log.txt";
 
 static char *HTML_HEADER = "<!DOCTYPE html><html><head></head><body>";
@@ -86,19 +88,19 @@ void load_status_codes() {
 
 //initialize server and poll for requests
 int main(int argc, char **argv) {
-	if (argc < 2 || argc > 5) {
-		puts("Usage:\t./server <port>");
+	if (argc < 3 || argc > 6) {
+		puts("Usage:\t./server <port> <host directory>");
 	puts("Optional:\n\tlog requests:\t-log [optional:file]\n\tuse https:\t-s");
 		exit(0);
 	}
 
 	//parse flags
-	for (int i=2; i < argc; i += 1) {
+	for (int i=3; i < argc; i += 1) {
 		if (strcmp(argv[i], "-log") == 0 ) {
 			if (argv[i+1] == NULL) {
 				http_log = fopen(DEFAULT_LOG, "a");
 			} else {
-				http_log = fopen(DEFAULT_LOG, "a");
+				http_log = fopen(argv[i+1], "a");
 			}
 			if (http_log == NULL) {
 					perror("Couldn't open log file");
@@ -115,6 +117,8 @@ int main(int argc, char **argv) {
 	//signal handling
 	signal(SIGINT, graceful_exit);
 	signal(SIGPIPE, acknowledge_sigpipe);
+
+        root_site = argv[2];
 
 	//start server
 	init_server(argv[1]);
@@ -223,19 +227,20 @@ int handle_request(int fd) {
 		if ((ret = get_header(req_info)) != 1) {
 			return ret;
 		}
+		req_info->stage = 1;
 	}
 
 	//log
 	if (http_log != NULL) {
-		int header_sample_len = (int)(strchr(req_info->request_h, '\n') - req_info->request_h);
-	char message[256];
+		int header_sample_len = (int)(strchr(req_info->request_h, '\n') - req_info->request_h) - 1;
+		char message[256];
 
-	sprintf((char*)&message, "[%s] \"%.*s\"\n", req_info->ip, header_sample_len, req_info->request_h); 
+		sprintf((char*)&message, "[%s] \"%.*s\"\n", req_info->ip, header_sample_len, req_info->request_h); 
 
-		int message_len = 1 + (int)(strchr((char*)&message, '\n') - (char*)&message);
+		int message_len = strlen((char*)&message);
 
-		fwrite(&message, message_len + 1, 1, http_log);
-	LOG("Logged: %.*s", message_len, message); 
+		fwrite(&message, message_len, 1, http_log);
+		LOG("Logged: %.*s", message_len, message); 
 	}
 
 	LOG("Req enum: %d\n", req_info->req_type);
@@ -261,7 +266,7 @@ int handle_request(int fd) {
 				req_info->response_h = calloc(1, MAX_HEADER_SIZE);
 			}
 
-			return send_status(fd, 405, req_info);
+			return send_error(fd, 405, req_info);
 		}
 	}
 
@@ -343,7 +348,7 @@ void accept_connections() {
 			perror("accept");
 			LOG("Failed to connect to a client\n");
 		} else if (fd >= 0) {
-		struct sockaddr_in *client_addr_in = (struct sockaddr_in *)&client_addr;
+			struct sockaddr_in *client_addr_in = (struct sockaddr_in *)&client_addr;
 			add_client(fd, inet_ntoa(client_addr_in->sin_addr));
 			accept_connections();
 			LOG("Accepted %s on file descriptor %d\n", inet_ntoa(client_addr_in->sin_addr), fd);
@@ -387,7 +392,7 @@ int get_header(request_info *req_info) {
 
 	//is header invalid?
 	if (read_status == -1) {
-		return send_status(fd, 431, req_info);
+		return send_error(fd, 431, req_info);
 	}
 
 	//Did we make progress?
@@ -421,7 +426,7 @@ int get_header(request_info *req_info) {
 int v_unknown(request_info *req_info) {
 	int fd = req_info->event->data.fd;
 
-	return send_status(fd, 400, req_info);
+	return send_error(fd, 400, req_info);
 }
 
 int get(request_info *req_info) {
@@ -430,15 +435,15 @@ int get(request_info *req_info) {
 	char filename[MAX_FILENAME_SIZE];
 
 	//Check if we can scan the filename
-	if (sscanf(req_info->request_h, "%*s %s", filename + strlen(ROOT_SITE)) != 1) {
-		return send_status(fd, 400, req_info);
+	if (sscanf(req_info->request_h, "%*s %s", filename + strlen(root_site)) != 1) {
+		return send_error(fd, 400, req_info);
 	}
 
-	// filename = ROOT_SITE .. filename (init.html if needed)
-	memcpy(filename, ROOT_SITE, strlen(ROOT_SITE));
+	// filename = root_site .. filename (index.html if needed)
+	memcpy(filename, root_site, strlen(root_site));
 	LOG("\tGET %s\n", filename);
 
-	//Attach \"init.html\" if they specified a directory
+	//Attach \"ndex.html\" if they specified a directory
 	//as opposed to a file (i.e. favicon.ico)
 	if (strchr(filename, '.') == NULL) {
 		if (filename[strlen(filename)-1] == '/') {
@@ -448,16 +453,16 @@ int get(request_info *req_info) {
 		}
 
 	} else if (strstr(filename, "..") != NULL) {
-		return send_status(fd, 403, req_info);
+		return send_error(fd, 403, req_info);
 	}
 
 	//Check if resource exists
-	if (access(filename, F_OK) != 0 && strstr(filename, "index.html")) {	
+	if (access(filename, F_OK) != 0 && strstr(filename, "/index.html")) {	
 		strstr(filename, "index.html")[0] = '\0';
 		return send_list(fd, filename, req_info);
 		
 	} else if (access(filename, F_OK) != 0 ) {
-		return send_status(fd, 404, req_info);
+		return send_error(fd, 404, req_info);
 	}
 
 	//Check file size
@@ -477,6 +482,8 @@ int get(request_info *req_info) {
 		if ((ret = send_status_n(fd, 200, req_info, file_size)) != 1) {
 			return ret;
 		}
+		req_info->stage += 1;
+		req_info->progress = 0;
 	}
 
 	//Get the actual file path, file size, and then write as much as possible
@@ -492,34 +499,40 @@ int get(request_info *req_info) {
 		ssize_t write_status = write_all_to_socket_from_file(fd, file, 
 			file_size - req_info->progress, req_info->progress);
 
-		fclose(file);
 
-		//Did we make progress?
-		if (write_status > 0) {
-			req_info->progress += write_status;
+		while (file != NULL) {
+			//Did we make progress?
+			if (write_status > 0) {
+				req_info->progress += write_status;
+			} else {
+				fclose(file);
+			}
+
+			LOG("File GET progress: %zu\n", req_info->progress);
+
+			//Return on block/error, otherwise go to next stage
+			if (errno == EWOULDBLOCK || errno == EAGAIN) {
+				LOG("GET blocked!\n");
+				//Resume request later
+				return 0;
+			} else if (errno == SIGPIPE) {
+				LOG("Sigpipe on %d\n", fd);
+				//Ignore request
+				return 3;
+			} else if (errno != 0) { //SIGPIPE or error
+				LOG("Error GETTING file\n");
+				//Ignore request
+				return 3;
+			} else {
+				LOG("Completed GETTING file!\n");
+				return 1; //Success!
+			}
 		}
 
-		LOG("File GET progress: %zu\n", req_info->progress);
-
-		//Return on block/error, otherwise go to next stage
-		if (errno == EWOULDBLOCK || errno == EAGAIN) {
-			LOG("GET blocked!\n");
-			//Resume request later
-			return 0;
-		} else if (errno == SIGPIPE) {
-			LOG("Sigpipe on %d\n", fd);
-			//Ignore request
-			return 3;
-		} else if (errno != 0) { //SIGPIPE or error
-			LOG("Error GETTING file\n");
-			//Ignore request
-			return 3;
-		} else {
-			LOG("Completed GETTING file!\n");
-			return 1; //Success!
-		}
+		return req_info->progress == file_size;
 
 	}
+	return 0;
 	
 }
 
@@ -530,24 +543,24 @@ int put(request_info *req_info) {
 	char filename[MAX_FILENAME_SIZE];
 
 	//Check if we can scan the filename
-	if (sscanf(req_info->request_h, "%*s %s", filename + strlen(ROOT_SITE)) != 1) {
-		return send_status(fd, 400, req_info);
+	if (sscanf(req_info->request_h, "%*s %s", filename + strlen(root_site)) != 1) {
+		return send_error(fd, 400, req_info);
 	}
 
-	// filename = ROOT_SITE .. filename (init.html if needed)
-	memcpy(filename, ROOT_SITE, strlen(ROOT_SITE));
+	// filename = root_site .. filename (index.html if needed)
+	memcpy(filename, root_site, strlen(root_site));
 	LOG("\tPOST %s\n", filename);
 
-	//Attach \"init.html\" if they specified a directory
+	//Attach \"index.html\" if they specified a directory
 	//as opposed to a file (i.e. favicon.ico)
 	if (strchr(filename, '.') == NULL) {
 		if (filename[strlen(filename)-1] == '/') {
-			strncat(filename, "init.html", 11);
+			strncat(filename, "index.html", 11);
 		} else {
-			strncat(filename, "/init.html", 11);
+			strncat(filename, "/index.html", 11);
 		}
 	} else if (strstr(filename, "..") != NULL) {
-		return send_status(fd, 403, req_info);
+		return send_error(fd, 403, req_info);
 	}
  
 	if (access(filename, F_OK) == 0) {
@@ -574,6 +587,8 @@ int put(request_info *req_info) {
 		if ((ret = send_status_n(fd, 200, req_info, file_size)) != 1) { 
 			return ret;
 		}
+		req_info->stage += 1;
+		req_info->progress = 0;
 	}
 
 	//Get the actual file path, file size, and then write as much as possible
@@ -610,6 +625,7 @@ int put(request_info *req_info) {
 			LOG("Completed POSTING file!\n");
 			return 1; //Success!
 		}
+		return req_info->progress == file_size;
 
 	}
 }
@@ -723,29 +739,24 @@ int send_list(int fd, char *filename, struct request_info *req_info) {
 
 	//make list in html
 	char buff[8096];
+	buff[0] = '\0';
 
-        DIR *d;
+        DIR *d = opendir(filename);
         struct dirent *dir;
-        d = opendir(filename);
 
         if (d == NULL) {
-            return send_status(fd, 404, req_info);
+            return send_error(fd, 404, req_info);
 	} else {			
 	    strcat((char*)&buff, HTML_HEADER);
             while ((dir = readdir(d)) != NULL) {
 	        if (dir->d_name[0] != '.' && dir->d_name[0] != '-') {
-	            strcat((char*)&buff, "<a href=\"");
-	            strcat((char*)&buff, filename + strlen(ROOT_SITE));
-	            strcat((char*)&buff, dir->d_name);
-	            strcat((char*)&buff, "\">");
-	            strcat((char*)&buff, dir->d_name);
-	            strcat((char*)&buff, "</a></br>");
+	            sprintf((char*)&buff + strlen((char*)&buff), "<a href=\"%s%s\">%s</a></br>", filename + strlen(root_site), dir->d_name, dir->d_name);
 	        }
 	    }
 
             closedir(d);	
 	    strcat((char*)&buff, HTML_FOOTER);
-    	}
+        }    	
 
     	int file_size = strlen((char*)&buff);
 	LOG("Sending directory listing to %d for %s\n", fd, filename);
@@ -755,7 +766,7 @@ int send_list(int fd, char *filename, struct request_info *req_info) {
 		if ((ret = send_status_n(fd, 200, req_info, file_size)) != 1) {
 	        	return ret;
 		}
-		req_info->stage = 2;
+		req_info->stage += 1;
 		req_info->progress = 0;
 	}
 
@@ -763,7 +774,7 @@ int send_list(int fd, char *filename, struct request_info *req_info) {
 	if (req_info->stage == 2) {
 		ssize_t write_status = write_all_to_socket(fd, 
 				(char*)&buff + req_info->progress, 
-				strlen((char*)&buff) - req_info->progress);
+				strlen((char*)&buff - req_info->progress));
 
 		//Did we make progress?
 		if (write_status > 0) {
@@ -784,34 +795,29 @@ int send_list(int fd, char *filename, struct request_info *req_info) {
 			//Ignore request
 			return 3;
 		}
-
-		req_info->stage += 1;
-		req_info->progress = 0;
+		return req_info->progress == strlen((char*)&buff);
 	}
 
-	return 1;
 }			
-/*
 int send_error(int fd, int status, struct request_info *req_info) {
 
 	//make list in html
 	char buff[8096];
-	char error[128];
-	
-	    strcat((char*)&buff, HTML_HEADER);
-	    strcat((char*)&buff, "<h2>Error code</h2>"
-	    strcat((char*)&buff, HTML_FOOTER);
-    	}
+	buff[0] = '\0';
+
+	strcat((char*)&buff, HTML_HEADER);
+	sprintf((char*)&buff + strlen((char*)&buff), "<h2>Error: %d %s</h2>", status, status_desc[status]);
+	strcat((char*)&buff, HTML_FOOTER);    	
 
     	int file_size = strlen((char*)&buff);
-	LOG("Sending directory listing to %d for %s\n", fd, filename);
+	LOG("Sending Error page %d to %d\n", status, fd);
 
 	if (req_info->stage == 1) {
 		int ret;
 		if ((ret = send_status_n(fd, 200, req_info, file_size)) != 1) {
 	        	return ret;
 		}
-		req_info->stage = 2;
+		req_info->stage += 1;
 		req_info->progress = 0;
 	}
 
@@ -819,7 +825,7 @@ int send_error(int fd, int status, struct request_info *req_info) {
 	if (req_info->stage == 2) {
 		ssize_t write_status = write_all_to_socket(fd, 
 				(char*)&buff + req_info->progress, 
-				strlen((char*)&buff) - req_info->progress);
+				strlen((char*)&buff - req_info->progress));
 
 		//Did we make progress?
 		if (write_status > 0) {
@@ -840,10 +846,7 @@ int send_error(int fd, int status, struct request_info *req_info) {
 			//Ignore request
 			return 3;
 		}
-
-		req_info->stage += 1;
-		req_info->progress = 0;
+		return req_info->progress == strlen((char*)&buff);
 	}
 
-	return 1;
-}*/
+}			
