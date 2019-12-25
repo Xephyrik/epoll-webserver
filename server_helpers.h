@@ -13,9 +13,10 @@
     #define LOG(...)
 #endif
 
-#define MAX_HEADER_SIZE 1024 //413 Entity Too large if header size > MAX_HEADER_SIZE
-#define MAX_FILENAME_SIZE 255
-#define SOCKET_BUFFER 8096
+#define MAX_HEADER_SIZE 8092 //413 Entity Too large if header size > MAX_HEADER_SIZE
+#define MAX_PATHNAME_SIZE 4096
+#define SOCKET_BUFFER 8092
+#define MAX_REQUEST_HEADER_FIELD_SIZE 256
 
 typedef enum { GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, V_UNKNOWN } verb;
 

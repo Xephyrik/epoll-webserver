@@ -1,0 +1,6 @@
+#!/bin/bash
+
+echo "Required Libraries:"
+echo -e "\tlibmagic-dev"
+gcc server_helpers.c webserver.c -o http_server -lmagic -DDEBUG && echo "Successfully Compiled" && exit 1;
+

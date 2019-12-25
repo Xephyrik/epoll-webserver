@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -17,6 +18,7 @@
 #include <sys/epoll.h>
 //#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <magic.h>
 
 #define BACKLOG 10
 #define TIMEOUT_MS 1000
@@ -45,17 +47,25 @@ int get(request_info *);
 int put(request_info *);
 int send_status(int fd, int status, struct request_info *);
 int send_status_n(int fd, int status, struct request_info *, size_t content_length);
-int send_list(int fd, char *filename, struct request_info *);
+int send_list(int fd, char *path, struct request_info *);
 int send_error(int fd, int status, struct request_info *);
+void set_mime_type(char *path, struct request_info *);
 
 struct request_info *client_requests[100];
 char *status_desc[510];
 
-char *root_site;
+char root_site[MAX_PATHNAME_SIZE];
+
 static char *DEFAULT_LOG = "http_log.txt";
+static char *DEFAULT_ROOT = "/srv/http/";
 
 static char *HTML_HEADER = "<!DOCTYPE html><html><head></head><body>";
 static char *HTML_FOOTER = "</body></html>";
+
+static char *SECURITY_HEADERS = "Cache-Control: private, max-age=0\n"
+				"X-Frame-Options: SAMEORIGIN\n"
+				"X-XSS-Protection: 1\n\n";
+				//"X-Content-Type-Options: nosniff\n\n";
 
 static volatile int epollfd;
 static volatile int server_socket;
@@ -73,6 +83,11 @@ struct request_info {
 	char *request_h; //header
 	char *response_h;
 	char *body;
+
+	size_t range_start;
+	size_t range_end;
+	
+	const char *mime_type;
 };
 
 void load_status_codes() {
@@ -83,19 +98,40 @@ void load_status_codes() {
 	status_desc[403] = "Forbidden";
 	status_desc[404] = "Not Found";
 	status_desc[405] = "Method Not Allowed";
+	status_desc[413] = "Payload Too Large";
+	status_desc[414] = "Too Long";
 	status_desc[431] = "Request Header Fields Too Large";
 }
 
+magic_t magic;
+
+//TODO: Make temporary directory with mkdtemp("XXXXX") for gzip compression and probably more
+//TODO: Fix block on read
+
 //initialize server and poll for requests
 int main(int argc, char **argv) {
-	if (argc < 3 || argc > 6) {
-		puts("Usage:\t./server <port> <host directory>");
-	puts("Optional:\n\tlog requests:\t-log [optional:file]\n\tuse https:\t-s");
+	if (argc < 2 || argc > 6) {
+		puts("Usage:\t./server <port> [host directory] [options]");
+		puts("Options: \n\t-p PORT \n\t-log LOG_FILE");
 		exit(0);
 	}
 
+	//Set root site
+	if (argc >= 3 && *argv[2] != '-') {
+        	char *result = realpath(argv[2], root_site);
+
+		if (result == NULL) {
+			puts("Host directory path could not be resolved");
+
+			graceful_exit(0);
+		}
+
+	} else {
+		strcpy(root_site, DEFAULT_ROOT);
+	}
+
 	//parse flags
-	for (int i=3; i < argc; i += 1) {
+	for (int i=2; i < argc; i += 1) {
 		if (strcmp(argv[i], "-log") == 0 ) {
 			if (argv[i+1] == NULL) {
 				http_log = fopen(DEFAULT_LOG, "a");
@@ -104,21 +140,25 @@ int main(int argc, char **argv) {
 			}
 			if (http_log == NULL) {
 					perror("Couldn't open log file");
-					exit(0);
+					
+					graceful_exit(0);
 			}
 		}
 		if (strcmp(argv[i], "-s") == 0) {
-			//open server in https
+			//Possibly: support https?
 		}
 	}
 
 	load_status_codes();
 
+	//load magiclib
+	magic = magic_open(MAGIC_MIME_TYPE);
+	magic_load(magic, NULL);
+	magic_compile(magic, NULL);
+
 	//signal handling
 	signal(SIGINT, graceful_exit);
 	signal(SIGPIPE, acknowledge_sigpipe);
-
-        root_site = argv[2];
 
 	//start server
 	init_server(argv[1]);
@@ -301,7 +341,7 @@ void init_server(const char *port) {
 	server_socket = socket(AF_INET, SOCK_STREAM, 0);
 
 	int optval = 1;
-	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+	if (setsockopt(server_socket, SOL_SOCKET, SO_BROADCAST || SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
 		perror("setsockopt");
 		graceful_exit(0);
 	}
@@ -363,6 +403,7 @@ void acknowledge_sigpipe(int arg) {
 }
 
 void graceful_exit(int arg) {
+
 	//remove any existing clients
 	for (int i=0; i < 100; i += 1) {
 		if (client_requests[i] != NULL) {
@@ -371,9 +412,17 @@ void graceful_exit(int arg) {
 	}
 
 	close(server_socket);
+
+	//close log
 	if (http_log != NULL) {
 		fclose(http_log);
 	}
+
+	//close magic
+	if (magic != NULL) {
+		magic_close(magic);
+	}
+
 	exit(0);
 }
 
@@ -388,11 +437,11 @@ int get_header(request_info *req_info) {
 	}
 
 	ssize_t read_status = read_header(fd, req_info->request_h + req_info->progress, MAX_HEADER_SIZE - req_info->progress);
-	LOG("\tRead status: %zu\n", read_status);
+	LOG("\tRead status: %zd\n", read_status);
 
-	//is header invalid?
+	//is header too long?
 	if (read_status == -1) {
-		return send_error(fd, 431, req_info);
+		return send_error(fd, 413, req_info);
 	}
 
 	//Did we make progress?
@@ -417,6 +466,48 @@ int get_header(request_info *req_info) {
 		return 3;
 	}
 
+	//Multiple checks for malformed/long requests or missing headers
+
+	//If empty
+	if (strlen(req_info->request_h) == 0) {
+		LOG("Empty request, moving on.\n");
+		return 1;
+	}
+
+	void *path_start = strchr(req_info->request_h, ' ') + 1;
+	void *protocol_start = strchr((char*)path_start, ' ') + 1;
+	void *header_end = strstr(req_info->request_h, "\n\n");
+
+	//Malformed
+	if (path_start == NULL || protocol_start == NULL || header_end
+			|| strncmp(protocol_start, "HTTP/", 5) != 0  ) {
+
+		return send_error(fd, 400, req_info);
+	}
+	
+	//Too Long
+	if ((int)(protocol_start - path_start - 1) > MAX_PATHNAME_SIZE) {
+		LOG("Path length of %d exceeded limit of %d\n",
+				(int)(protocol_start - path_start - 1), MAX_PATHNAME_SIZE);
+
+		return send_error(fd, 414, req_info);
+	}
+
+	//Host header
+	if (strstr(req_info->request_h, "Host:") == NULL) {
+		return send_error(fd, 400, req_info);
+	}
+
+	//Check range
+	req_info->range_start = 0;
+	req_info->range_end = 0;
+
+	//Scan in range
+	if (strstr(req_info->request_h, "Range:") != NULL) {
+		sscanf(req_info->request_h, "Range: bytes=%zu-%zu\n", &req_info->range_start, &req_info->range_end);
+	}
+	
+
 	LOG("completed reading header!\n");
 	req_info->stage = 1;
 	req_info->progress = 0;
@@ -432,54 +523,66 @@ int v_unknown(request_info *req_info) {
 int get(request_info *req_info) {
 	int fd = req_info->event->data.fd;
 
-	char filename[MAX_FILENAME_SIZE];
+	// path = root_site .. path (index.html if needed)
+	char path[MAX_PATHNAME_SIZE + strlen(root_site) + 1];
+	memcpy(path, root_site, strlen(root_site));
 
-	//Check if we can scan the filename
-	if (sscanf(req_info->request_h, "%*s %s", filename + strlen(root_site)) != 1) {
+	//Scan path
+	if (sscanf(req_info->request_h, "%*s %s", path + strlen(root_site) - 1) != 1) {
 		return send_error(fd, 400, req_info);
 	}
 
-	// filename = root_site .. filename (index.html if needed)
-	memcpy(filename, root_site, strlen(root_site));
-	LOG("\tGET %s\n", filename);
+	//Append request path
+	LOG("\tGET %s\n", path);
 
 	//Attach \"ndex.html\" if they specified a directory
 	//as opposed to a file (i.e. favicon.ico)
-	if (strchr(filename, '.') == NULL) {
-		if (filename[strlen(filename)-1] == '/') {
-			strncat(filename, "index.html", 11);
+	if (strchr(path, '.') == NULL) {
+		if (path[strlen(path)-1] == '/') {
+			strncat(path, "index.html", 11);
 		} else {
-			strncat(filename, "/index.html", 11);
+			strncat(path, "/index.html", 11);
 		}
 
-	} else if (strstr(filename, "..") != NULL) {
+	} else if (strstr(path, "..") != NULL) {
 		return send_error(fd, 403, req_info);
 	}
 
 	//Check if resource exists
-	if (access(filename, F_OK) != 0 && strstr(filename, "/index.html")) {	
-		strstr(filename, "index.html")[0] = '\0';
-		return send_list(fd, filename, req_info);
+	if (access(path, F_OK) != 0 && strstr(path + strlen(root_site), "/index.html")) {	
+		strstr(path, "index.html")[0] = '\0';
+		return send_list(fd, path, req_info);
 		
-	} else if (access(filename, F_OK) != 0 ) {
+	} else if (access(path, F_OK) != 0 ) {
 		return send_error(fd, 404, req_info);
 	}
 
 	//Check file size
 	struct stat file_stat;
-	if (stat(filename, &file_stat) == -1) {
+	if (stat(path, &file_stat) == -1) {
 		perror("stat");
 		return 3;
 	}
 	size_t file_size = (size_t)file_stat.st_size;
 
-	LOG("Final file path: %s, File size: %zu\n", filename, file_size);
+	LOG("Final file path: %s, File size: %zu\n", path, file_size);
+
+	if (req_info->range_end == 0) {
+		req_info->range_end = file_size;
+	}
+
+	//range_end = max(range_end, file_size)
+	req_info->range_end = req_info->range_end <= file_size ? req_info->range_end : file_size;
+	LOG("Range: bytes=%zu-%zu\n", req_info->range_start, req_info->range_end);
+
+	set_mime_type(path, req_info);
 
 	if (req_info->stage == 1) {
 
 		//send response header, returning on block or error
 		int ret = 0;
-		if ((ret = send_status_n(fd, 200, req_info, file_size)) != 1) {
+		if ((ret = send_status_n(fd, 200, req_info, 
+				req_info->range_end - req_info->range_start)) != 1) {
 			return ret;
 		}
 		req_info->stage += 1;
@@ -494,11 +597,11 @@ int get(request_info *req_info) {
 			return 1;
 		}
 
-		FILE *file = fopen(filename, "r");
+		FILE *file = fopen(path, "r");
 
 		ssize_t write_status = write_all_to_socket_from_file(fd, file, 
-			file_size - req_info->progress, req_info->progress);
-
+				req_info->range_end - req_info->range_start - req_info->progress, 
+				req_info->range_start + req_info->progress);
 
 		while (file != NULL) {
 			//Did we make progress?
@@ -540,31 +643,31 @@ int put(request_info *req_info) {
 
 	int fd = req_info->event->data.fd;
 
-	char filename[MAX_FILENAME_SIZE];
+	// path = root_site .. path (index.html if needed)
+	char path[MAX_PATHNAME_SIZE + strlen(root_site) + 1];
+	memcpy(path, root_site, strlen(root_site));
 
-	//Check if we can scan the filename
-	if (sscanf(req_info->request_h, "%*s %s", filename + strlen(root_site)) != 1) {
+	//Scan path
+	if (sscanf(req_info->request_h, "%*s %s", path + strlen(root_site) - 1) != 1) {
 		return send_error(fd, 400, req_info);
 	}
 
-	// filename = root_site .. filename (index.html if needed)
-	memcpy(filename, root_site, strlen(root_site));
-	LOG("\tPOST %s\n", filename);
+	LOG("\tPOST %s\n", path);
 
 	//Attach \"index.html\" if they specified a directory
 	//as opposed to a file (i.e. favicon.ico)
-	if (strchr(filename, '.') == NULL) {
-		if (filename[strlen(filename)-1] == '/') {
-			strncat(filename, "index.html", 11);
+	if (strchr(path, '.') == NULL) {
+		if (path[strlen(path)-1] == '/') {
+			strncat(path, "index.html", 11);
 		} else {
-			strncat(filename, "/index.html", 11);
+			strncat(path, "/index.html", 11);
 		}
-	} else if (strstr(filename, "..") != NULL) {
+	} else if (strstr(path, "..") != NULL) {
 		return send_error(fd, 403, req_info);
 	}
  
-	if (access(filename, F_OK) == 0) {
-		remove(filename);
+	if (access(path, F_OK) == 0) {
+		remove(path);
 	}
 
 	//Check file size
@@ -578,7 +681,7 @@ int put(request_info *req_info) {
 	size_t file_size = 0;
 	sscanf(cont_length, "%*s %zu\n", &file_size);
 
-	LOG("Final file path: %s, File size: %zu\n", filename, file_size);
+	LOG("Final file path: %s, File size: %zu\n", path, file_size);
 
 	if (req_info->stage == 1) {
 
@@ -594,7 +697,7 @@ int put(request_info *req_info) {
 	//Get the actual file path, file size, and then write as much as possible
 	if (req_info->stage == 2) {
 
-		FILE *file = fopen(filename, "w");
+		FILE *file = fopen(path, "w");
 
 		ssize_t write_status = read_all_from_socket_to_file(fd, file, 
 			file_size - req_info->progress, req_info->progress);
@@ -647,8 +750,21 @@ int send_status(int fd, int status, struct request_info *req_info) {
 
 		sprintf(req_info->response_h, "HTTP/1.1 %d %s\n"
 				"Date: %s\n"
-				"Connection: close\n\n",
-				200, status_desc[200], date);
+				"Connection: close\n",
+				status, status_desc[status], date);
+
+		if (req_info->range_end != 0) {
+			sprintf(req_info->response_h + strlen(req_info->response_h), 
+					"Content-Range: bytes=%zu-%zu\n", req_info->range_start,
+					req_info->range_end);
+		}
+
+		if (req_info->mime_type != NULL) { //TODO: Make this work
+			sprintf(req_info->response_h + strlen(req_info->response_h), 
+					"Content-Type: %s\n", req_info->mime_type);
+		}	
+
+		strncat(req_info->response_h, SECURITY_HEADERS, strlen(SECURITY_HEADERS));
 	}
 
 
@@ -700,8 +816,22 @@ int send_status_n(int fd, int status, struct request_info *req_info, size_t file
 		sprintf(req_info->response_h, "HTTP/1.1 %d %s\n"
 				"Date: %s\n"
 				"Connection: close\n"
-				"Content-Length: %zu\n\n",
+				"Content-Length: %zu\n",
 				status, status_desc[status], date, file_size);
+
+		if (req_info->range_end != 0) {
+			sprintf(req_info->response_h + strlen(req_info->response_h), 
+					"Content-Range: bytes=%zu-%zu\n", req_info->range_start,
+					req_info->range_end);
+		}
+		
+
+		if (req_info->mime_type != NULL) { //TODO: Make this work
+			sprintf(req_info->response_h + strlen(req_info->response_h), 
+					"Content-Type: %s\n", req_info->mime_type);
+		}	
+
+		strncat(req_info->response_h, SECURITY_HEADERS, strlen(SECURITY_HEADERS));
 	}
 
 	ssize_t write_status = write_all_to_socket(fd, 
@@ -735,13 +865,13 @@ int send_status_n(int fd, int status, struct request_info *req_info, size_t file
 	return 1;
 }			
 
-int send_list(int fd, char *filename, struct request_info *req_info) {
+int send_list(int fd, char *path, struct request_info *req_info) {
 
 	//make list in html
 	char buff[8096];
 	buff[0] = '\0';
 
-        DIR *d = opendir(filename);
+        DIR *d = opendir(path);
         struct dirent *dir;
 
         if (d == NULL) {
@@ -750,7 +880,7 @@ int send_list(int fd, char *filename, struct request_info *req_info) {
 	    strcat((char*)&buff, HTML_HEADER);
             while ((dir = readdir(d)) != NULL) {
 	        if (dir->d_name[0] != '.' && dir->d_name[0] != '-') {
-	            sprintf((char*)&buff + strlen((char*)&buff), "<a href=\"%s%s\">%s</a></br>", filename + strlen(root_site), dir->d_name, dir->d_name);
+	            sprintf((char*)&buff + strlen((char*)&buff), "<a href=\"%s%s\">%s</a></br>", path + strlen(root_site), dir->d_name, dir->d_name);
 	        }
 	    }
 
@@ -759,7 +889,7 @@ int send_list(int fd, char *filename, struct request_info *req_info) {
         }    	
 
     	int file_size = strlen((char*)&buff);
-	LOG("Sending directory listing to %d for %s\n", fd, filename);
+	LOG("Sending directory listing to %d for %s\n", fd, path);
 
 	if (req_info->stage == 1) {
 		int ret;
@@ -849,4 +979,22 @@ int send_error(int fd, int status, struct request_info *req_info) {
 		return req_info->progress == strlen((char*)&buff);
 	}
 
-}			
+}	
+void set_mime_type(char *path, struct request_info *req_info) {
+	//check mime type
+	if (strstr(path, ".html") != NULL) {
+		req_info->mime_type = "text/html";
+	} else if (strstr(path, ".css") != NULL) {
+		req_info->mime_type = "text/css";
+	} else if (strstr(path, ".js") != NULL) {
+		req_info->mime_type = "text/javascript";
+	} else if (strstr(path, ".mp4") != NULL) {
+		req_info->mime_type = "video/mp4";
+	} else if (strstr(path, ".jpg") != NULL) {
+		req_info->mime_type = "image/jpeg";
+	} else if (strstr(path, ".png") != NULL) {
+		req_info->mime_type = "image/png";
+	} else {
+		req_info->mime_type = magic_file(magic, path);
+	}
+}
