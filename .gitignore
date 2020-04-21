@@ -4,3 +4,4 @@ http_server
 #ignore logs
 *.log
 *.txt
+*.mgc

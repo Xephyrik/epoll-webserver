@@ -19,14 +19,15 @@
 //#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <magic.h>
+#include <libconfig.h>
 
 #define BACKLOG 10
-#define TIMEOUT_MS 1000
 #define EVENT_BUFFER 100
 
+//default
+#define DEFAULT_TIMEOUT_MS 1000
 
 typedef struct request_info request_info;
-
 
 // main functions
 void init_server();
@@ -50,27 +51,34 @@ int send_status_n(int fd, int status, struct request_info *, size_t content_leng
 int send_list(int fd, char *path, struct request_info *);
 int send_error(int fd, int status, struct request_info *);
 void set_mime_type(char *path, struct request_info *);
+void parse_config(config_t *cf);
 
-struct request_info *client_requests[100];
-char *status_desc[510];
-
-char root_site[MAX_PATHNAME_SIZE];
-
-static char *DEFAULT_LOG = "http_log.txt";
-static char *DEFAULT_ROOT = "/srv/http/";
-
+//Constants
 static char *HTML_HEADER = "<!DOCTYPE html><html><head></head><body>";
 static char *HTML_FOOTER = "</body></html>";
 
-static char *SECURITY_HEADERS = "Cache-Control: private, max-age=0\n"
+char *status_desc[510];
+
+//Config settings
+static const char *CONFIG_FILE = "/etc/epoll-webserver/server.conf";
+
+static const char *DEFAULT_LOG_FILE = "/etc/epoll-server/log.txt";
+static char *DEFAULT_SECURITY_HEADERS = "Cache-Control: private, max-age=0\n"
 				"X-Frame-Options: SAMEORIGIN\n"
 				"X-XSS-Protection: 1\n\n";
 				//"X-Content-Type-Options: nosniff\n\n";
 
+char *port = NULL;
+static int max_file_size = 0;
+static int timeout_ms = 0;
+char *root_site = NULL;
+char *security_headers = NULL;
+FILE *http_log = NULL;
+
+//Server info
 static volatile int epollfd;
 static volatile int server_socket;
-
-FILE *http_log = NULL;
+struct request_info *client_requests[100];
 
 struct request_info {
 	struct epoll_event *event;
@@ -104,80 +112,63 @@ void load_status_codes() {
 }
 
 magic_t magic;
+static char *MAGIC_FILE = "/usr/local/misc/magic.msc";
 
 //TODO: Make temporary directory with mkdtemp("XXXXX") for gzip compression and probably more
+//actually, just get the stdout of a forked gzip compression or php execution
+
 //TODO: Fix block on read
+
+void print_usage() {
+	puts("Usage:\t./server");
+	puts("Please set port and webserver_root in the server.conf (i.e. port = \"80\")");
+	puts("Other configuration options:");
+	puts("\tlog_file, security_headers, max_file_size, timeout_ms");
+	exit(0);
+}
 
 //initialize server and poll for requests
 int main(int argc, char **argv) {
-	if (argc < 2 || argc > 6) {
-		puts("Usage:\t./server <port> [host directory] [options]");
-		puts("Options: \n\t-p PORT \n\t-log LOG_FILE");
-		exit(0);
-	}
 
-	//Set root site
-	if (argc >= 3 && *argv[2] != '-') {
-        	char *result = realpath(argv[2], root_site);
+	//Read config
+	config_t cfg, *cf;
+	cf = &cfg;
+	config_init(cf);
+	parse_config(cf);
 
-		if (result == NULL) {
-			puts("Host directory path could not be resolved");
-
-			graceful_exit(0);
-		}
-
-	} else {
-		strcpy(root_site, DEFAULT_ROOT);
-	}
-
-	//parse flags
-	for (int i=2; i < argc; i += 1) {
-		if (strcmp(argv[i], "-log") == 0 ) {
-			if (argv[i+1] == NULL) {
-				http_log = fopen(DEFAULT_LOG, "a");
-			} else {
-				http_log = fopen(argv[i+1], "a");
-			}
-			if (http_log == NULL) {
-					perror("Couldn't open log file");
-					
-					graceful_exit(0);
-			}
-		}
-		if (strcmp(argv[i], "-s") == 0) {
-			//Possibly: support https?
-		}
+	if (argc > 1) {
+		print_usage();
 	}
 
 	load_status_codes();
 
 	//load magiclib
 	magic = magic_open(MAGIC_MIME_TYPE);
-	magic_load(magic, NULL);
-	magic_compile(magic, NULL);
+	magic_load(magic, MAGIC_FILE);
+	magic_compile(magic, MAGIC_FILE);
 
 	//signal handling
 	signal(SIGINT, graceful_exit);
 	signal(SIGPIPE, acknowledge_sigpipe);
 
 	//start server
-	init_server(argv[1]);
-	LOG("Server Initialized on port %s\n", argv[1]);
+	init_server();
+	LOG("Server Initialized on port %s\n", port);
 
 	//mark file descriptors as non-blocking
 	int flags = fcntl(server_socket, F_GETFL, 0);
-	fcntl(server_socket, F_SETFL, flags | O_NONBLOCK);
-
+	flags |= O_NONBLOCK;
+	fcntl(server_socket, F_SETFL, flags);
 	//start epolling
 	epollfd = epoll_create(1);
-	LOG("Polling for requests");
+	LOG("Polling for requests\n");
 	while (1) {
 		accept_connections();
 		
 		struct epoll_event array[EVENT_BUFFER];
 
 		//Get events
-		int num_events = epoll_wait(epollfd, array, EVENT_BUFFER, TIMEOUT_MS);
+		int num_events = epoll_wait(epollfd, array, EVENT_BUFFER, timeout_ms);
 		if (num_events == -1) {
 			perror("epoll_wait");
 			graceful_exit(0);
@@ -216,7 +207,7 @@ void add_client(int fd, char *ip) {
 	if (client_requests[fd] == NULL) {
 		struct request_info *req_info = calloc(1, sizeof(struct request_info));
 		req_info->event = ev;
-	req_info->ip = ip;
+		req_info->ip = ip;
 
 		client_requests[fd] = req_info;		
 		LOG("Added client %d\n", fd);
@@ -337,7 +328,7 @@ verb check_verb(char *header) {
 }
 
 //initialize server
-void init_server(const char *port) {
+void init_server() {
 	server_socket = socket(AF_INET, SOCK_STREAM, 0);
 
 	int optval = 1;
@@ -355,7 +346,7 @@ void init_server(const char *port) {
 	//get addrinfo for host from hints
 	int result = getaddrinfo("0.0.0.0", port, &hints, &infoptr);
 	if (result) {
-		fprintf(stderr, "%s\n", gai_strerror(result));
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(result));
 		graceful_exit(0);
 	}
 
@@ -421,6 +412,18 @@ void graceful_exit(int arg) {
 	//close magic
 	if (magic != NULL) {
 		magic_close(magic);
+	}
+
+	if (security_headers != NULL) {
+		free(security_headers);
+	}
+
+	if (port != NULL) {
+		free(port);
+	}
+
+	if (root_site != NULL) {
+		free(root_site);
 	}
 
 	exit(0);
@@ -528,20 +531,20 @@ int get(request_info *req_info) {
 	memcpy(path, root_site, strlen(root_site));
 
 	//Scan path
-	if (sscanf(req_info->request_h, "%*s %s", path + strlen(root_site) - 1) != 1) {
+	if (sscanf(req_info->request_h, "%*s %s", path + strlen(root_site)) != 1) {
 		return send_error(fd, 400, req_info);
 	}
 
 	//Append request path
 	LOG("\tGET %s\n", path);
 
-	//Attach \"ndex.html\" if they specified a directory
+	//Attach \"index.html\" if they specified a directory
 	//as opposed to a file (i.e. favicon.ico)
 	if (strchr(path, '.') == NULL) {
 		if (path[strlen(path)-1] == '/') {
-			strncat(path, "index.html", 11);
+			strncat(path, "index.php", 11);
 		} else {
-			strncat(path, "/index.html", 11);
+			strncat(path, "/index.php", 11);
 		}
 
 	} else if (strstr(path, "..") != NULL) {
@@ -549,11 +552,17 @@ int get(request_info *req_info) {
 	}
 
 	//Check if resource exists
+	if (access(path, F_OK) != 0 && strstr(path + strlen(root_site), "/index.php")) {	
+		strstr(path, ".php")[0] = '\0';
+		strncat(path, ".html", 6);
+	}
+	
 	if (access(path, F_OK) != 0 && strstr(path + strlen(root_site), "/index.html")) {	
 		strstr(path, "index.html")[0] = '\0';
 		return send_list(fd, path, req_info);
-		
-	} else if (access(path, F_OK) != 0 ) {
+	}
+
+	if (access(path, F_OK) != 0) {
 		return send_error(fd, 404, req_info);
 	}
 
@@ -607,8 +616,6 @@ int get(request_info *req_info) {
 			//Did we make progress?
 			if (write_status > 0) {
 				req_info->progress += write_status;
-			} else {
-				fclose(file);
 			}
 
 			LOG("File GET progress: %zu\n", req_info->progress);
@@ -616,24 +623,30 @@ int get(request_info *req_info) {
 			//Return on block/error, otherwise go to next stage
 			if (errno == EWOULDBLOCK || errno == EAGAIN) {
 				LOG("GET blocked!\n");
+				fclose(file);
+
 				//Resume request later
 				return 0;
 			} else if (errno == SIGPIPE) {
 				LOG("Sigpipe on %d\n", fd);
+				fclose(file);
+
 				//Ignore request
 				return 3;
 			} else if (errno != 0) { //SIGPIPE or error
 				LOG("Error GETTING file\n");
+				fclose(file);
+
 				//Ignore request
 				return 3;
-			} else {
+			} else if (req_info->progress == file_size) {
 				LOG("Completed GETTING file!\n");
+				fclose(file);
 				return 1; //Success!
 			}
 		}
 
 		return req_info->progress == file_size;
-
 	}
 	return 0;
 	
@@ -658,9 +671,9 @@ int put(request_info *req_info) {
 	//as opposed to a file (i.e. favicon.ico)
 	if (strchr(path, '.') == NULL) {
 		if (path[strlen(path)-1] == '/') {
-			strncat(path, "index.html", 11);
+			strncat(path, "index.html", 12);
 		} else {
-			strncat(path, "/index.html", 11);
+			strncat(path, "/index.html", 12);
 		}
 	} else if (strstr(path, "..") != NULL) {
 		return send_error(fd, 403, req_info);
@@ -764,7 +777,7 @@ int send_status(int fd, int status, struct request_info *req_info) {
 					"Content-Type: %s\n", req_info->mime_type);
 		}	
 
-		strncat(req_info->response_h, SECURITY_HEADERS, strlen(SECURITY_HEADERS));
+		strncat(req_info->response_h, security_headers, strlen(security_headers));
 	}
 
 
@@ -831,7 +844,7 @@ int send_status_n(int fd, int status, struct request_info *req_info, size_t file
 					"Content-Type: %s\n", req_info->mime_type);
 		}	
 
-		strncat(req_info->response_h, SECURITY_HEADERS, strlen(SECURITY_HEADERS));
+		strncat(req_info->response_h, security_headers, strlen(security_headers));
 	}
 
 	ssize_t write_status = write_all_to_socket(fd, 
@@ -996,5 +1009,78 @@ void set_mime_type(char *path, struct request_info *req_info) {
 		req_info->mime_type = "image/png";
 	} else {
 		req_info->mime_type = magic_file(magic, path);
+	}
+}
+
+void parse_config(config_t* cf) {
+
+	const char *log_file_path = NULL;
+
+	if (config_read_file(cf, CONFIG_FILE)) {
+
+		//root path
+		const char* temp_root = NULL;
+		config_lookup_string(cf, "webserver_root", &temp_root);
+		root_site = strdup(temp_root);
+		LOG("Root of webserver: %s\n", root_site);
+
+		//port
+		const char* temp_port = NULL;
+		config_lookup_string(cf, "port", &temp_port);
+		port = strdup(temp_port);
+		LOG("Host port: %s\n", port);
+
+		//log
+		config_lookup_string(cf, "log_file", &log_file_path);
+		if (log_file_path != NULL) {
+
+			http_log = fopen(log_file_path, "a");
+			if (http_log == NULL) {
+				perror("Couldn't find log file");
+				config_destroy(cf);
+				graceful_exit(0);
+			}
+
+			LOG("Using log file at %s\n", log_file_path);
+		}
+
+		const config_setting_t* s_headers = config_lookup(cf, "security_headers");
+		if (s_headers == NULL) {
+			security_headers = DEFAULT_SECURITY_HEADERS;
+		} else {
+			security_headers = malloc(256);
+			security_headers[0] = '\0';
+			for (int i = 0; i < config_setting_length(s_headers); i++) {
+				const char* header = config_setting_get_string_elem(s_headers, i);
+
+				char buf[256];
+				sprintf((char*)&buf, "%s\n", header);
+				strcat(security_headers, (char*)&buf);
+			}
+
+			strcat(security_headers, "\n");
+
+			LOG("Security headers:\n\n%s", security_headers);
+		}
+
+		config_lookup_int(cf, "max_file_size", &max_file_size);
+		LOG("Using max file size of %d\n", max_file_size);
+
+		config_lookup_int(cf, "timeout_ms", &timeout_ms);
+		if (timeout_ms <= 0) {
+			timeout_ms = DEFAULT_TIMEOUT_MS;
+		}
+
+		LOG("Using timeout of %d\n", timeout_ms);
+
+	} else {
+		perror("Couldnt get config file");
+		config_destroy(cf);
+		graceful_exit(0);
+	}
+
+	config_destroy(cf);
+	if (port == NULL || root_site == NULL) {
+		print_usage();
 	}
 }
