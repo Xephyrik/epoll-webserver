@@ -2,11 +2,13 @@
 
 echo "Required Libraries:"
 echo -e "\tlibmagic-dev"
-echo -e "\tlibconfig-dev"
+
+cd "$(dirname $(realpath $0))" &&
 
 gcc `pkg-config --cflags libconfig` server_helpers.c webserver.c -o http_server -lmagic -DDEBUG \
-	`pkg-config --libs libconfig` && 
+`pkg-config --libs libconfig` && 
 
 rsync -a template-folder/ /etc/epoll-webserver &&
+cp http_server /bin/ &&
 echo "Successfully Compiled" && exit 1;
 

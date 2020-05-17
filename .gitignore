@@ -1,7 +1,2 @@
 #ignore executable
 http_server
-
-#ignore logs
-*.log
-*.txt
-*.mgc
